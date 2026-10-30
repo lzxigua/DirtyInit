@@ -29,7 +29,7 @@ jobs:
       - name: Compile ARM64 static
         run: |
           NDK="${{ steps.ndk.outputs.ndk-path }}"
-          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
 
           if [ ! -x "$CLANG" ]; then
             echo "ERROR: clang not found at $CLANG"
