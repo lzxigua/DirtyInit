@@ -6966,9 +6966,11 @@ static int cmd_xxd(int sock, int argc, char *argv[]) {
 static int cmd_base64(int sock, int argc, char *argv[]) {
     int decode = 0;
     const char *file = NULL;
+    const char *out_file = NULL; // 新增：输出文件
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0) decode = 1;
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_file = argv[++i]; // 解析 -o
         else file = argv[i];
     }
 
@@ -6984,6 +6986,10 @@ static int cmd_base64(int sock, int argc, char *argv[]) {
         return 1;
     }
 
+    // 分配输出缓冲区 (最大是源文件的 3/4 或者相等)
+    uint8_t *out_buf = malloc(sz + 4); 
+    size_t out_len = 0;
+
     if (decode) {
         /* Decode base64 */
         size_t i = 0;
@@ -6998,11 +7004,11 @@ static int cmd_base64(int sock, int argc, char *argv[]) {
             unsigned char c = (i < (size_t)sz && data[i] != '=') ? (unsigned char)b64_dec_table[data[i++]] : 0;
             unsigned char d_val = (i < (size_t)sz && data[i] != '=') ? (unsigned char)b64_dec_table[data[i++]] : 0;
 
-            putchar((char)((a << 2) | (b >> 4)));
+            out_buf[out_len++] = (char)((a << 2) | (b >> 4));
             if (i >= 3 && data[i-2] != '=')
-                putchar((char)(((b & 0xF) << 4) | (c >> 2)));
+                out_buf[out_len++] = (char)(((b & 0xF) << 4) | (c >> 2));
             if (i >= 4 && data[i-1] != '=')
-                putchar((char)(((c & 0x3) << 6) | d_val));
+                out_buf[out_len++] = (char)(((c & 0x3) << 6) | d_val);
         }
     } else {
         /* Encode */
@@ -7012,18 +7018,42 @@ static int cmd_base64(int sock, int argc, char *argv[]) {
             unsigned char b = (i + 1 < sz) ? data[i + 1] : 0;
             unsigned char c = (i + 2 < sz) ? data[i + 2] : 0;
 
-            putchar(b64_enc[a >> 2]);
-            putchar(b64_enc[((a & 3) << 4) | (b >> 4)]);
-            putchar((i + 1 < sz) ? b64_enc[((b & 0xF) << 2) | (c >> 6)] : '=');
-            putchar((i + 2 < sz) ? b64_enc[c & 0x3F] : '=');
+            out_buf[out_len++] = b64_enc[a >> 2];
+            out_buf[out_len++] = b64_enc[((a & 3) << 4) | (b >> 4)];
+            out_buf[out_len++] = (i + 1 < sz) ? b64_enc[((b & 0xF) << 2) | (c >> 6)] : '=';
+            out_buf[out_len++] = (i + 2 < sz) ? b64_enc[c & 0x3F] : '=';
 
             col += 4;
-            if (col >= 76) { putchar('\n'); col = 0; }
+            if (col >= 76) { out_buf[out_len++] = '\n'; col = 0; }
         }
-        if (col > 0) putchar('\n');
+        if (col > 0) out_buf[out_len++] = '\n';
+    }
+
+    // 写入文件或者打印到标准输出
+    if (out_file) {
+        char out_abs[CWD_SIZE];
+        resolve_path(out_file, out_abs);
+        
+        // 直接在当前进程（init 域）调用 openat 和 write
+        int fd = syscall(SYS_openat, AT_FDCWD, out_abs, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            fprintf(stderr, "base64: cannot create %s: %s\n", out_abs, strerror(errno));
+        } else {
+            size_t written = 0;
+            while (written < out_len) {
+                ssize_t w = syscall(SYS_write, fd, out_buf + written, out_len - written);
+                if (w <= 0) break;
+                written += w;
+            }
+            syscall(SYS_close, fd);
+            printf("Decoded %zu bytes to %s\n", out_len, out_abs);
+        }
+    } else {
+        for (size_t k = 0; k < out_len; k++) putchar(out_buf[k]);
     }
 
     fflush(stdout);
+    free(out_buf);
     free(data);
     return 0;
 }
