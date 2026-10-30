@@ -1,0 +1,56 @@
+name: Build DirtyInit (ARM64)
+
+on:
+  push:
+    branches: [ main, master, dev ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-arm64:
+    name: Build static ARM64 binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+
+      - name: Show toolchain
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" --version
+
+      - name: Compile ARM64 static
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+
+          if [ ! -x "$CLANG" ]; then
+            echo "ERROR: clang not found at $CLANG"
+            ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/" | grep aarch64 || true
+            exit 1
+          fi
+
+          # -include stdarg.h  → va_list  (ovlog_write)
+          # -include strings.h → strcasecmp / strncasecmp (signal_by_name)
+          "$CLANG" -static -O2 \
+            -include stdarg.h -include strings.h \
+            -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable \
+            -o dirtyinit native/dirtyinit.c
+
+          file dirtyinit
+          ls -lh dirtyinit
+          sha256sum dirtyinit
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtyinit-arm64
+          path: dirtyinit
+          if-no-files-found: error
