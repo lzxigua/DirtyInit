@@ -108,7 +108,7 @@ static void ovlog_write(int prio, const char *fmt, ...) {
 #define PAGE_SIZE       4096
 #define DATA_OFFSET     64
 #define DATA_SIZE       (PAGE_SIZE - DATA_OFFSET)
-#define INPUT_BUF_SIZE  2048
+#define INPUT_BUF_SIZE  32768
 #define CWD_SIZE        1024
 #define MAX_ARGS        64
 #define RECONNECT_MAX   3
