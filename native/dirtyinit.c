@@ -6966,11 +6966,19 @@ static int cmd_xxd(int sock, int argc, char *argv[]) {
 static int cmd_base64(int sock, int argc, char *argv[]) {
     int decode = 0;
     const char *file = NULL;
-    const char *out_file = NULL; // 新增：输出文件
+    int redir_type = 0;
+    const char *redir_file = NULL;
 
+    // 1. 解析重定向符 (处理 > 或 >>)
+    int redir_idx = find_redirect(argc, argv, &redir_type);
+    if (redir_idx > 0 && redir_idx + 1 < argc) {
+        redir_file = argv[redir_idx + 1];
+        argc = redir_idx; // 截断参数，防止后面的目标文件名被误认为源文件
+    }
+
+    // 2. 解析 -d 和源文件
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0) decode = 1;
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_file = argv[++i]; // 解析 -o
         else file = argv[i];
     }
 
@@ -6986,9 +6994,10 @@ static int cmd_base64(int sock, int argc, char *argv[]) {
         return 1;
     }
 
-    // 分配输出缓冲区 (最大是源文件的 3/4 或者相等)
-    uint8_t *out_buf = malloc(sz + 4); 
+    // 3. 准备输出缓冲区 (防止文件太大撑爆，最大按 64KB 算)
+    uint8_t out_buf[65536];
     size_t out_len = 0;
+    #define OUT_CHAR(c) do { if (out_len < sizeof(out_buf)) out_buf[out_len++] = (uint8_t)(c); } while(0)
 
     if (decode) {
         /* Decode base64 */
@@ -7004,11 +7013,11 @@ static int cmd_base64(int sock, int argc, char *argv[]) {
             unsigned char c = (i < (size_t)sz && data[i] != '=') ? (unsigned char)b64_dec_table[data[i++]] : 0;
             unsigned char d_val = (i < (size_t)sz && data[i] != '=') ? (unsigned char)b64_dec_table[data[i++]] : 0;
 
-            out_buf[out_len++] = (char)((a << 2) | (b >> 4));
+            OUT_CHAR((char)((a << 2) | (b >> 4)));
             if (i >= 3 && data[i-2] != '=')
-                out_buf[out_len++] = (char)(((b & 0xF) << 4) | (c >> 2));
+                OUT_CHAR((char)(((b & 0xF) << 4) | (c >> 2)));
             if (i >= 4 && data[i-1] != '=')
-                out_buf[out_len++] = (char)(((c & 0x3) << 6) | d_val);
+                OUT_CHAR((char)(((c & 0x3) << 6) | d_val));
         }
     } else {
         /* Encode */
@@ -7018,42 +7027,43 @@ static int cmd_base64(int sock, int argc, char *argv[]) {
             unsigned char b = (i + 1 < sz) ? data[i + 1] : 0;
             unsigned char c = (i + 2 < sz) ? data[i + 2] : 0;
 
-            out_buf[out_len++] = b64_enc[a >> 2];
-            out_buf[out_len++] = b64_enc[((a & 3) << 4) | (b >> 4)];
-            out_buf[out_len++] = (i + 1 < sz) ? b64_enc[((b & 0xF) << 2) | (c >> 6)] : '=';
-            out_buf[out_len++] = (i + 2 < sz) ? b64_enc[c & 0x3F] : '=';
+            OUT_CHAR(b64_enc[a >> 2]);
+            OUT_CHAR(b64_enc[((a & 3) << 4) | (b >> 4)]);
+            OUT_CHAR((i + 1 < sz) ? b64_enc[((b & 0xF) << 2) | (c >> 6)] : '=');
+            OUT_CHAR((i + 2 < sz) ? b64_enc[c & 0x3F] : '=');
 
             col += 4;
-            if (col >= 76) { out_buf[out_len++] = '\n'; col = 0; }
+            if (col >= 76) { OUT_CHAR('\n'); col = 0; }
         }
-        if (col > 0) out_buf[out_len++] = '\n';
+        if (col > 0) OUT_CHAR('\n');
     }
 
-    // 写入文件或者打印到标准输出
-    if (out_file) {
-        char out_abs[CWD_SIZE];
-        resolve_path(out_file, out_abs);
-        
-        // 直接在当前进程（init 域）调用 openat 和 write
-        int fd = syscall(SYS_openat, AT_FDCWD, out_abs, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // 4. 根据是否有重定向，决定写文件还是打印到屏幕
+    if (redir_file) {
+        char abs_dst[CWD_SIZE];
+        resolve_path(redir_file, abs_dst);
+
+        int oflags = MY_O_WRONLY | MY_O_CREAT;
+        if (redir_type == 1) oflags |= MY_O_TRUNC;
+        else oflags |= MY_O_APPEND;
+
+        int64_t fd = relay_openat(sock, abs_dst, oflags, 0644);
         if (fd < 0) {
-            fprintf(stderr, "base64: cannot create %s: %s\n", out_abs, strerror(errno));
-        } else {
-            size_t written = 0;
-            while (written < out_len) {
-                ssize_t w = syscall(SYS_write, fd, out_buf + written, out_len - written);
-                if (w <= 0) break;
-                written += w;
-            }
-            syscall(SYS_close, fd);
-            printf("Decoded %zu bytes to %s\n", out_len, out_abs);
+            fprintf(stderr, "base64: %s: %s\n", abs_dst, errno_str((int)(-fd)));
+            free(data);
+            return 1;
         }
+
+        if (out_len > 0) {
+            relay_write(sock, fd, out_buf, out_len); // 一次性把解码后的二进制写入文件
+        }
+        relay_close(sock, fd);
     } else {
-        for (size_t k = 0; k < out_len; k++) putchar(out_buf[k]);
+        // 没有重定向，还是老老实实输出到屏幕
+        fwrite(out_buf, 1, out_len, stdout);
+        fflush(stdout);
     }
 
-    fflush(stdout);
-    free(out_buf);
     free(data);
     return 0;
 }
