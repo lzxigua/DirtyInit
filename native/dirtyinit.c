@@ -5560,8 +5560,19 @@ static int cmd_dexec(int sock, int argc, char *argv[]) {
     }
 
     /* --- TALKING TO CHILD --- */
-    /* Build execve page: strings at data[0..2047], argv ptrs at data[2048..] */
+    /* Build execve page: strings at data[0..argv_off), pointer arrays at data[argv_off..DATA_SIZE) */
     {
+        const char *env_strings[] = {
+            "ANDROID_DATA=/data",
+            "ANDROID_ART_ROOT=/apex/com.android.art",
+            "ANDROID_ROOT=/system",
+            "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
+            "LD_LIBRARY_PATH=/apex/com.android.art/lib64:/apex/com.android.runtime/lib64:/system/lib64",
+            "BOOTCLASSPATH=/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/framework-graphics.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/apex/com.android.i18n/javalib/core-icu4j.jar:/system/framework/featurelayer-widget.jar:/system/framework/hwEmui.jar:/system/framework/hwPartBasicplatform.jar:/system/framework/telephony-separated.jar:/system/framework/hwTelephony-common.jar:/system/framework/hwPartTelephony.jar:/system/framework/hwPartTelephonyVSim.jar:/system/framework/hwPartTelephonyCust.jar:/system/framework/hwPartTelephonyFullnetworkOpt.jar:/system/framework/hwPartTelephonyTimezoneOpt.jar:/system/framework/hwPartTelephonyOpt.jar:/system/framework/hwPartSecurity.jar:/system/framework/hwPartUserIAM.jar:/system/framework/hwPartSecurityFaceId.jar:/system/framework/hwIms-common.jar:/system/framework/hwPartMedia.jar:/system/framework/hwPartConnectivity.jar:/system/framework/hwPartPowerOffice.jar:/system/framework/hwPartDeviceVirtualization.jar:/system/framework/hwPartAirSharing.jar:/system/framework/hwPartDefaultDFR.jar:/system/framework/hwPartDFR.jar:/system/framework/hwPartMagicWindow.jar:/system/framework/hwPartsXlayout.jar:/system/framework/hwPartIaware.jar:/system/framework/hwPartMdm.jar:/system/framework/hwPartVr.jar:/system/framework/hwframework.jar:/system/framework/com.huawei.nfc.jar:/system/framework/org.ifaa.android.manager.jar:/system/framework/hwperf.jar:/system/framework/hwcustEmui.jar:/system/framework/hwcustframework.jar:/system/framework/servicehost.jar:/system/framework/hwcustIms-common.jar:/system/framework/hwcustTelephony-common.jar:/system/framework/hwIAwareAL.jar:/system/framework/zframework.z.jar",
+            "PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin",
+            NULL
+        };
+
         uint8_t page[PAGE_SIZE];
         memset(page, 0, PAGE_SIZE);
 
@@ -5569,17 +5580,28 @@ static int cmd_dexec(int sock, int argc, char *argv[]) {
         int str_offsets[MAX_ARGS];
         int exec_argc = argc - exec_argv_start;
 
-        if (exec_argc > MAX_ARGS - 1 ||
-            2048 + ((size_t)exec_argc + 1) * 8 > DATA_SIZE) {
+        int env_count = 0;
+        while (env_strings[env_count] != NULL) env_count++;
+
+        if (exec_argc > MAX_ARGS - 1) {
             fprintf(stderr, "dexec: too many arguments (%d)\n", exec_argc);
             goto child_abort;
         }
+
+        int ptr_bytes = (exec_argc + 1) * 8 + (env_count + 1) * 8;
+        if (ptr_bytes > DATA_SIZE) {
+            fprintf(stderr, "dexec: pointer arrays too large (%d bytes > %d DATA_SIZE)\n",
+                    ptr_bytes, DATA_SIZE);
+            goto child_abort;
+        }
+        int argv_off = DATA_SIZE - ptr_bytes;
+        int envp_off = argv_off + (exec_argc + 1) * 8;
 
         uint8_t *data = page + DATA_OFFSET;
 
         /* Pack exec binary path at offset 0 (used by x0 for filename) */
         size_t blen = strlen(exec_binary) + 1;
-        if (blen > 2048) {
+        if (blen > (size_t)argv_off) {
             fprintf(stderr, "dexec: path too long\n");
             goto child_abort;
         }
@@ -5590,8 +5612,9 @@ static int cmd_dexec(int sock, int argc, char *argv[]) {
         for (int i = 0; i < exec_argc; i++) {
             const char *arg = argv[exec_argv_start + i];
             size_t alen = strlen(arg) + 1;
-            if (str_off + (int)alen > 2048) {
-                fprintf(stderr, "dexec: argv too large\n");
+            if (str_off + (int)alen > argv_off) {
+                fprintf(stderr, "dexec: argv too large (overflow at %d, limit %d)\n",
+                        str_off + (int)alen, argv_off);
                 goto child_abort;
             }
             str_offsets[i] = str_off;
@@ -5599,17 +5622,39 @@ static int cmd_dexec(int sock, int argc, char *argv[]) {
             str_off += (int)alen;
         }
 
-        /* Pack argv pointer array at offset 2048 */
-        for (int i = 0; i < exec_argc; i++)
-            pack_u64(data + 2048 + i * 8, data_base + (uint64_t)str_offsets[i]);
-        pack_u64(data + 2048 + exec_argc * 8, 0);
+        /* Pack envp strings after argv strings */
+        int env_offsets[MAX_ARGS];
+        int env_str_off = str_off;
+        for (int i = 0; i < env_count; i++) {
+            size_t elen = strlen(env_strings[i]) + 1;
+            if (env_str_off + (int)elen > argv_off) {
+                fprintf(stderr,
+                    "dexec: envp strings overflow at [%d/%d] \"%s\" (need %d at off %d, limit %d)\n",
+                    i, env_count, env_strings[i],
+                    env_str_off + (int)elen, env_str_off, argv_off);
+                goto child_abort;
+            }
+            env_offsets[i] = env_str_off;
+            memcpy(data + env_str_off, env_strings[i], elen);
+            env_str_off += (int)elen;
+        }
 
-        /* Page header: execve(path, argv, NULL) */
+        /* Pack argv pointer array at data + argv_off */
+        for (int i = 0; i < exec_argc; i++)
+            pack_u64(data + argv_off + i * 8, data_base + (uint64_t)str_offsets[i]);
+        pack_u64(data + argv_off + exec_argc * 8, 0);
+
+        /* Pack envp pointer array at data + envp_off */
+        for (int i = 0; i < env_count; i++)
+            pack_u64(data + envp_off + i * 8, data_base + (uint64_t)env_offsets[i]);
+        pack_u64(data + envp_off + env_count * 8, 0);
+
+        /* Page header: execve(path, argv, envp) */
         pack_u64(page + 0,  SYS_execve);
         pack_u64(page + 8,  0);            /* x0: path at data+0 */
-        pack_u64(page + 16, 2048);         /* x1: argv at data+2048 */
-        pack_u64(page + 24, 0);            /* x2: envp = NULL (no FLAG) */
-        pack_u32(page + 56, FLAG_X0_DATA | FLAG_X1_DATA);
+        pack_u64(page + 16, argv_off);     /* x1: argv ptr array */
+        pack_u64(page + 24, envp_off);     /* x2: envp ptr array */
+        pack_u32(page + 56, FLAG_X0_DATA | FLAG_X1_DATA | FLAG_X2_DATA);
 
         send_full(sock, page, PAGE_SIZE);
         uint8_t resp[PAGE_SIZE];
